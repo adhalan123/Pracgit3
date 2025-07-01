@@ -1,0 +1,140 @@
+#!/usr/bin/env groovy
+def currentTime = new Date()
+def dynamicContainerName = "AWS_2.0_automation_run_"+currentTime.format("yyMMdd.HHmm")
+pipeline {
+    agent {
+        node {
+            //label 'awsjenklinux && !(awsjenklinux1 || awsjenklinux5)'
+            label 'awsjenklinux&&!(awsjenklinux1||awsjenklinux5)'
+           // label 'awsjenklinux3'
+        }
+    }
+    parameters {
+    //General test parameters
+        choice(name: 'BROWSER',
+            choices: [
+                'Chrome',
+                'Firefox',
+                'Edge'
+            ],
+            description: 'Browser to run test suite in.')
+
+        choice(name: 'ENV',
+              choices: [
+                 'advqa',
+                 'awsstgmain',
+                 'advtools-uat',
+                 'advtools',
+                 'PROD-DR'
+              ],
+              description: 'Environment to run test suite in.')
+
+        choice(name: 'SUITE',
+                choices: [
+                        'src/test/resources/smoke.xml',
+                        'src/test/resources/regression.xml'
+                ],
+                description: 'Suite to be executed')
+
+        text(name: 'CONFIGURATION',
+            defaultValue: '"{\\"reportOptions\\": {\\"emailRecipients\\":[\\"aarati.dhalange@gmail.com\\",\\"dhalange13@gmail.com\\"]},\\"server\\":{\\"CIHub\\":\\"http://selenium-hub:4444/wd/hub\\"}}"',
+            description: 'Alternative config to framework')
+
+        string(name:'BRANCH', defaultValue:'master', description:'Specify branch name')
+    }
+    options {
+        skipDefaultCheckout(true)
+    }
+    stages {
+        stage('Pre-build: Clean WS & Checkout SCM') {
+            steps {
+                script {
+                    cleanWs()
+                    checkout scm
+                }
+            }
+        }
+        stage('Start Browsers Grid') {
+            options {
+                retry(2)
+            }
+            steps {
+                script {
+                    def gridCommand
+                    if (params.ENV == 'PROD-DR') {
+                        gridCommand = "docker-compose -f AWS_SAT/docker-compose-dr.yml up -d --force-recreate"
+                    }
+                    else {
+                        gridCommand = "docker-compose -f AWS_SAT/docker-compose.yml up -d --force-recreate"
+                    }
+                    def node_chrome = 0
+                    def node_firefox = 0
+                    def node_edge = 0
+
+                    if (params.BROWSER == 'Chrome') {
+                        node_chrome = 5
+                    } else if (params.BROWSER == 'Firefox') {
+                        node_firefox = 5
+                    }  else if (params.BROWSER == 'Edge') {
+                        node_edge = 5
+                    }
+                    gridCommand += " --scale node-chrome=${node_chrome} --scale node-firefox=${node_firefox} --scale node-edge=${node_edge} --scale automation=0"
+                    sh "${gridCommand}"
+                }
+            }
+        }
+        stage('Execute UI Tests') {
+            options {
+                retry(2)
+            }
+            steps {
+                script {
+                    def env = params.ENV.replace("PROD-DR", "advtools")
+                    def mvnCommand = "mvn -B -f pom.xml -Dplatform=LINUX -Dmode= -DuseGrid=false -DbrowserType=${params.BROWSER} -Denv=${env} -Dmaven.filepath=${params.SUITE} -Dconfig=${params.CONFIGURATION} -DbrowserVersion= clean test"
+                    try {
+                        if (params.ENV == 'PROD-DR') {
+                            sh "docker-compose -f AWS_SAT/docker-compose-dr.yml run --name ${dynamicContainerName} --entrypoint='${mvnCommand}' automation"
+                        }
+                        else {
+                            sh "docker-compose -f AWS_SAT/docker-compose.yml run --name ${dynamicContainerName} --entrypoint='${mvnCommand}' automation"
+                        }
+                    }
+                    catch (Exception e) {
+                        echo "Some exception has occurred! Removing the container for retrying..."
+                        sh "docker rm -f ${dynamicContainerName}"
+                        throw e
+                    }
+                }
+            }
+        }
+        stage('Copy Tests Results') {
+            steps {
+                //script {
+                //    sh "docker cp aws-sso-saml_automation_run:/usr/src/mymaven/target ./target"
+                //    sh "docker cp aws-sso-saml_automation_run:/usr/src/mymaven/test-output ./test-output"
+                //}
+                step([$class: 'Publisher'])
+            }
+        }
+    }
+    post {
+        always {
+                script {
+                    if (params.ENV == 'PROD-DR'){
+                        sh "docker-compose -f AWS_SAT/docker-compose-dr.yml down"
+                    }
+                    else {
+                        sh "docker-compose -f AWS_SAT/docker-compose.yml down"
+                    }
+                }
+            publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'AWS_SAT',
+                            reportFiles: 'ExtentReport.html',
+                            reportName: 'Extent Report',
+                            reportTitles: ''])
+        }
+    }
+}
